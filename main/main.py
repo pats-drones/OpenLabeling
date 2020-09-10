@@ -4,9 +4,10 @@ import glob
 import json
 import os
 import re
-
+import configparser
 import cv2
 import numpy as np
+import pandas as pd
 from tqdm import tqdm
 
 from lxml import etree
@@ -25,7 +26,7 @@ cv2.destroyAllWindows()
 
 
 parser = argparse.ArgumentParser(description='Open-source image labeling tool')
-parser.add_argument('-i', '--input_dir', default='input', type=str, help='Path to input directory')
+parser.add_argument('-i', '--input_dir', default='/home/pats/Documents/datasets/contains_moth.csv', type=str, help='Path to input directory')
 parser.add_argument('-o', '--output_dir', default='output', type=str, help='Path to output directory')
 parser.add_argument('-t', '--thickness', default='1', type=int, help='Bounding box and cross line thickness')
 parser.add_argument('--draw-from-PASCAL-files', action='store_true', help='Draw bounding boxes from the PASCAL files') # default YOLO
@@ -45,6 +46,7 @@ class_index = 0
 img_index = 0
 img = None
 img_objects = []
+mirror_objects = []
 
 INPUT_DIR  = args.input_dir
 OUTPUT_DIR = args.output_dir
@@ -62,6 +64,20 @@ annotation_formats = {'PASCAL_VOC' : '.xml', 'YOLO_darknet' : '.txt'}
 TRACKER_DIR = os.path.join(OUTPUT_DIR, '.tracker')
 
 DRAW_FROM_PASCAL = args.draw_from_PASCAL_files
+
+# Read config
+config = configparser.ConfigParser()
+config.read('config.ini')
+mirror_label = config.getboolean('MOTH_PARAMETERS', 'mirror_labels') 
+read_log = config.getboolean('MOTH_PARAMETERS', 'read_logs') 
+column_names_path_batist = config.get('MOTH_PARAMETERS', 'log_column_names_path_batist') 
+column_names_path_holstein = config.get('MOTH_PARAMETERS', 'log_column_names_path_holstein') 
+
+# read column names
+column_names = pd.read_csv(column_names_path_batist, sep=";").columns
+column_names_bat = [name.replace(" ", "") for name in column_names]
+column_names = pd.read_csv(column_names_path_holstein, sep=";").columns
+column_names_hol = [name.replace(" ", "") for name in column_names]
 
 # selected bounding box
 prev_was_double_click = False
@@ -189,7 +205,7 @@ class dragBBox:
 
 def display_text(text, time):
     if WITH_QT:
-        cv2.displayOverlay(WINDOW_NAME, text, time)
+        cv2.displayStatusBar(WINDOW_NAME, text, time)
     else:
         print(text)
 
@@ -199,7 +215,7 @@ def set_img_index(x):
     img_path = IMAGE_PATH_LIST[img_index]
     img = cv2.imread(img_path)
     text = 'Showing image {}/{}, path: {}'.format(str(img_index), str(last_img_index), img_path)
-    display_text(text, 1000)
+    display_text(text, 5000)
 
 
 def set_class_index(x):
@@ -237,7 +253,6 @@ def draw_line(img, x, y, height, width, color):
     cv2.line(img, (x, 0), (x, height), color, LINE_THICKNESS)
     cv2.line(img, (0, y), (width, y), color, LINE_THICKNESS)
 
-
 def yolo_format(class_index, point_1, point_2, width, height):
     # YOLO wants everything normalized
     # Order: class x_center y_center x_width y_height
@@ -257,7 +272,6 @@ def voc_format(class_name, point_1, point_2):
     return items
 
 def findIndex(obj_to_find):
-    #return [(ind, img_objects[ind].index(obj_to_find)) for ind in xrange(len(img_objects)) if item in img_objects[ind]]
     ind = -1
 
     ind_ = 0
@@ -282,10 +296,15 @@ def write_xml(xml_str, xml_path):
 
 def append_bb(ann_path, line, extension):
     if '.txt' in extension:
-        with open(ann_path, 'a') as myfile:
-            myfile.write(line + '\n') # append line
+        with open(ann_path, 'r+') as myfile:
+            line += '\n'
+            lines =  myfile.readlines()
+            if line not in lines:
+                myfile.write(line) # append line
+            
     elif '.xml' in extension:
         class_name, xmin, ymin, xmax, ymax = line
+        xmin, ymin, xmax, ymax = map( str, list(map(int, list(map(float, [xmin, ymin, xmax, ymax]))))) # worst way to tranform from str(floats) -> str(ints)
 
         tree = ET.parse(ann_path)
         annotation = tree.getroot()
@@ -296,16 +315,24 @@ def append_bb(ann_path, line, extension):
         ET.SubElement(obj, 'truncated').text = '0'
         ET.SubElement(obj, 'difficult').text = '0'
 
-        bbox = ET.SubElement(obj, 'bndbox')
-        ET.SubElement(bbox, 'xmin').text = xmin
-        ET.SubElement(bbox, 'ymin').text = ymin
-        ET.SubElement(bbox, 'xmax').text = xmax
-        ET.SubElement(bbox, 'ymax').text = ymax
+        bboxes = []
+        for obj in annotation.findall('object'):
+            if obj.find('bndbox'):
+                bboxes.append(list(map(str, get_xml_object_data(obj))))
+                
+                
+        if [class_name, str(CLASS_LIST.index(class_name)), xmin, ymin, xmax, ymax] not in bboxes: # if label does not exist yet, add
+            bbox = ET.SubElement(obj, 'bndbox')
+            ET.SubElement(bbox, 'xmin').text = xmin
+            ET.SubElement(bbox, 'ymin').text = ymin
+            ET.SubElement(bbox, 'xmax').text = xmax
+            ET.SubElement(bbox, 'ymax').text = ymax
 
-        xml_str = ET.tostring(annotation)
-        write_xml(xml_str, ann_path)
+            xml_str = ET.tostring(annotation)
+            write_xml(xml_str, ann_path)
 
 
+        
 def yolo_to_voc(x_center, y_center, x_width, y_height, width, height):
     x_center *= float(width)
     y_center *= float(height)
@@ -324,10 +351,10 @@ def get_xml_object_data(obj):
     class_name = obj.find('name').text
     class_index = CLASS_LIST.index(class_name)
     bndbox = obj.find('bndbox')
-    xmin = int(bndbox.find('xmin').text)
-    xmax = int(bndbox.find('xmax').text)
-    ymin = int(bndbox.find('ymin').text)
-    ymax = int(bndbox.find('ymax').text)
+    xmin = int(float(bndbox.find('xmin').text))
+    xmax = int(float(bndbox.find('xmax').text))
+    ymin = int(float(bndbox.find('ymin').text))
+    ymax = int(float(bndbox.find('ymax').text))
     return [class_name, class_index, xmin, ymin, xmax, ymax]
 
 
@@ -400,12 +427,14 @@ def draw_bboxes_from_file(tmp_img, annotation_paths, width, height):
                 color = class_rgb[class_index].tolist()
                 # draw bbox
                 cv2.rectangle(tmp_img, (xmin, ymin), (xmax, ymax), color, LINE_THICKNESS)
+                if mirror_label:
+                    cv2.rectangle(tmp_img, (xmin-848, ymin), (xmax-848, ymax), color, LINE_THICKNESS)
                 # draw resizing anchors if the object is selected
                 if is_bbox_selected:
                     if idx == selected_bbox:
                         tmp_img = draw_bbox_anchors(tmp_img, xmin, ymin, xmax, ymax, color)
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                cv2.putText(tmp_img, class_name, (xmin, ymin - 5), font, 0.6, color, LINE_THICKNESS, cv2.LINE_AA)
+                # font = cv2.FONT_HERSHEY_SIMPLEX
+                # cv2.putText(tmp_img, class_name, (xmin, ymin - 5), font, 0.6, color, LINE_THICKNESS, cv2.LINE_AA)
         else:
             # Draw from YOLO
             with open(ann_path) as fp:
@@ -417,12 +446,14 @@ def draw_bboxes_from_file(tmp_img, annotation_paths, width, height):
                     color = class_rgb[class_index].tolist()
                     # draw bbox
                     cv2.rectangle(tmp_img, (xmin, ymin), (xmax, ymax), color, LINE_THICKNESS)
+                    if mirror_label:
+                        cv2.rectangle(tmp_img, (xmin-848, ymin), (xmax-848, ymax), color, LINE_THICKNESS)
                     # draw resizing anchors if the object is selected
                     if is_bbox_selected:
                         if idx == selected_bbox:
                             tmp_img = draw_bbox_anchors(tmp_img, xmin, ymin, xmax, ymax, color)
-                    font = cv2.FONT_HERSHEY_SIMPLEX
-                    cv2.putText(tmp_img, class_name, (xmin, ymin - 5), font, 0.6, color, LINE_THICKNESS, cv2.LINE_AA)
+                    # font = cv2.FONT_HERSHEY_SIMPLEX
+                    # cv2.putText(tmp_img, class_name, (xmin, ymin - 5), font, 0.6, color, LINE_THICKNESS, cv2.LINE_AA)
     return tmp_img
 
 
@@ -604,57 +635,61 @@ def mouse_listener(event, x, y, flags, param):
     # mouse callback function
     global is_bbox_selected, prev_was_double_click, mouse_x, mouse_y, point_1, point_2
 
-    set_class = True
-    if event == cv2.EVENT_MOUSEMOVE:
-        mouse_x = x
-        mouse_y = y
-    elif event == cv2.EVENT_LBUTTONDBLCLK:
-        prev_was_double_click = True
-        #print('Double click')
-        point_1 = (-1, -1)
-        # if clicked inside a bounding box we set that bbox
-        set_selected_bbox(set_class)
-    # By AlexeyGy: delete via right-click
-    elif event == cv2.EVENT_RBUTTONDOWN:
-        set_class = False
-        set_selected_bbox(set_class)
-        if is_bbox_selected:
-            obj_to_edit = img_objects[selected_bbox]
-            edit_bbox(obj_to_edit, 'delete')
-            is_bbox_selected = False
-    elif event == cv2.EVENT_LBUTTONDOWN:
-        if prev_was_double_click:
-            #print('Finish double click')
-            prev_was_double_click = False
-        else:
-            #print('Normal left click')
+    if x > 848: #only have functionality on right image
+        
 
-            # Check if mouse inside on of resizing anchors of the selected bbox
+        set_class = True
+        if event == cv2.EVENT_MOUSEMOVE:
+            mouse_x = x
+            mouse_y = y
+        elif event == cv2.EVENT_LBUTTONDBLCLK:
+            prev_was_double_click = True
+            #print('Double click')
+            point_1 = (-1, -1)
+            # if clicked inside a bounding box we set that bbox
+            set_selected_bbox(set_class)
+        # By AlexeyGy: delete via right-click
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            set_class = False
+            set_selected_bbox(set_class)
             if is_bbox_selected:
-                dragBBox.handler_left_mouse_down(x, y, img_objects[selected_bbox])
+                obj_to_edit = img_objects[selected_bbox]
+                edit_bbox(obj_to_edit, 'delete')
+                is_bbox_selected = False
+        elif event == cv2.EVENT_LBUTTONDOWN:
+            if prev_was_double_click:
+                #print('Finish double click')
+                prev_was_double_click = False
+            else:
+                #print('Normal left click')
 
-            if dragBBox.anchor_being_dragged is None:
-                if point_1[0] == -1:
-                    if is_bbox_selected:
-                        if is_mouse_inside_delete_button():
-                            set_selected_bbox(set_class)
-                            obj_to_edit = img_objects[selected_bbox]
-                            edit_bbox(obj_to_edit, 'delete')
-                        is_bbox_selected = False
+                # Check if mouse inside on of resizing anchors of the selected bbox
+                if is_bbox_selected:
+                    dragBBox.handler_left_mouse_down(x, y, img_objects[selected_bbox])
+
+
+                if dragBBox.anchor_being_dragged is None:
+                    if point_1[0] == -1:
+                        if is_bbox_selected:
+                            if is_mouse_inside_delete_button():
+                                set_selected_bbox(set_class)
+                                obj_to_edit = img_objects[selected_bbox]
+                                edit_bbox(obj_to_edit, 'delete')
+                            is_bbox_selected = False
+                        else:
+                            # first click (start drawing a bounding box or delete an item)
+
+                            point_1 = (x, y)
                     else:
-                        # first click (start drawing a bounding box or delete an item)
+                        # minimal size for bounding box to avoid errors
+                        threshold = 5
+                        if abs(x - point_1[0]) > threshold or abs(y - point_1[1]) > threshold:
+                            # second click
+                            point_2 = (x, y)
 
-                        point_1 = (x, y)
-                else:
-                    # minimal size for bounding box to avoid errors
-                    threshold = 5
-                    if abs(x - point_1[0]) > threshold or abs(y - point_1[1]) > threshold:
-                        # second click
-                        point_2 = (x, y)
-
-    elif event == cv2.EVENT_LBUTTONUP:
-        if dragBBox.anchor_being_dragged is not None:
-            dragBBox.handler_left_mouse_up(x, y)
+        elif event == cv2.EVENT_LBUTTONUP:
+            if dragBBox.anchor_being_dragged is not None:
+                dragBBox.handler_left_mouse_up(x, y)
 
 
 
@@ -689,33 +724,127 @@ def natural_sort_key(s, _nsre=re.compile('([0-9]+)')):
     return [int(text) if text.isdigit() else text.lower()
             for text in _nsre.split(s)]
 
+def change_mp4_to_csv_name(filename):
+    if filename.endswith("mp4"):
+        ext = "mp4"
+    else:
+        ext = "mkv"
+    return filename.replace("insect", "log").replace("videoRawLR", "log").replace("cut_video", "log").replace(ext, "csv")
 
-def convert_video_to_images(video_path, n_frames, desired_img_format):
+def get_grower_name(video_path: str):
+    return video_path.split(os.sep)[5]
+
+
+def convert_video_to_images(video_path, n_frames, desired_img_format, class_list=None, read_log=False):
+    grower_name = get_grower_name(video_path)
+    insect_file_name  = "log_itrk0.csv"
     # create folder to store images (if video was not converted to images already)
     file_path, file_extension = os.path.splitext(video_path)
+    saved_boxes = {}
     # append extension to avoid collision of videos with same name
     # e.g.: `video.mp4`, `video.avi` -> `video_mp4/`, `video_avi/`
     file_extension = file_extension.replace('.', '_')
     file_path += file_extension
     video_name_ext = os.path.basename(file_path)
+      
+    print(f"Converting {video_path} to individual frames")
+
+    if read_log:
+        p, f = os.path.split(video_path)
+        f_csv = change_mp4_to_csv_name(f)
+        p_csv = os.path.join(p, f_csv)
+        df = pd.read_csv(p_csv, names=column_names_bat, sep=";")
+        if grower_name != "batist": # newer file formats for instance for holstein
+            #get insect df to connect RS_ID on from the drone csv
+            rpath, filename = os.path.split(p_csv)
+            if grower_name != "holstein":
+                insect_file_name = "insect.csv"
+            insect_file_path = os.path.join(rpath, insect_file_name)
+            df_insect = pd.read_csv(insect_file_path, sep=";")
+
+        else:  # old file formats
+            df_trimmed = df.loc[np.trim_zeros(df['foundL_insect'], "b").index] # remove the last part of df where no more insect is detected
+
+
+    cap = cv2.VideoCapture(video_path)
     if not os.path.exists(file_path):
-        print(' Converting video to individual frames...')
-        cap = cv2.VideoCapture(video_path)
         os.makedirs(file_path)
-        # read the video
-        for i in tqdm(range(n_frames)):
-            if not cap.isOpened():
-                break
-            # capture frame-by-frame
-            ret, frame = cap.read()
-            if ret == True:
-                # save each frame (we use this format to avoid repetitions)
-                frame_name =  '{}_{}{}'.format(video_name_ext, i, desired_img_format)
-                frame_path = os.path.join(file_path, frame_name)
-                cv2.imwrite(frame_path, frame)
-        # release the video capture object
-        cap.release()
-    return file_path, video_name_ext
+    # read the video
+    df_i = 4
+    kernel = np.ones((3,3),np.uint8)
+
+    for i in tqdm(range(n_frames)):
+        if not cap.isOpened():
+            break
+        # capture frame-by-frame
+        ret, frame = cap.read()
+        if frame is None:
+            break
+        
+
+        if i == 0:
+            if grower_name != "batist" and grower_name != "holstein": #old video formats
+                raw_frame1 = frame[:480,:,:]
+            else:
+                raw_frame1 = frame[:,:848,:]
+            continue
+        else:
+            if grower_name != "batist" and grower_name != "holstein": #old video formats
+                raw_frame2 = frame[:480,:,:]
+            else:
+                raw_frame2 = frame[:,:848,:]
+            diff = cv2.absdiff(raw_frame1, raw_frame2)
+            diff[diff > 2] = 255
+            diff = cv2.morphologyEx(diff, cv2.MORPH_OPEN, kernel)
+            new_img = np.concatenate((raw_frame2, diff), axis=1)
+            raw_frame1 = raw_frame2
+
+        if ret == True:
+            # save each frame (we use this format to avoid repetitions)
+            frame_name =  '{}_{}{}'.format(video_name_ext, i, desired_img_format)
+            frame_path = os.path.join(file_path, frame_name)
+            cv2.imwrite(frame_path, new_img)
+            h, w = new_img.shape[0], new_img.shape[1]
+
+            if read_log:
+                try: # get the bouding boxes from the frame
+                    if grower_name != "batist": # new file formats
+                         # get insect info based on RS_ID 
+                        RS_ID = df['RS_ID'].iloc[df_i]
+                        
+                        if grower_name != "holstein":
+                            RS_ID = int(RS_ID)
+
+                        insect_row = df_insect[df_insect['RS_ID'] == RS_ID]
+
+                        # in some formats column names have spaces, so sterialize
+                        insect_row.columns = [col.replace(" ", "") for col in insect_row.columns]
+
+                        found = int(insect_row["foundL_insect"].values[0])
+                        x = int(insect_row["imLx_insect"].values[0])
+                        y = int(insect_row["imLy_insect"].values[0])
+
+                        
+                    else: # old file formats
+                        found = df_trimmed['foundL_insect'].iloc[df_i]
+                        x = int(df_trimmed['imLx_insect'].iloc[df_i]) 
+                        y = int(df_trimmed['imLy_insect'].iloc[df_i])
+                       
+                    if x > 0:
+                        # if grower_name == "batist" or grower_name == "holstein":
+                        x += 848
+                        point_1, point_2 = [max(0, x-10), max(0, y-10)], [min(w, x+10), min(h, y+10)]
+                        saved_boxes[f"{frame_path}_l"] = [0, point_1, point_2, w, h]
+
+                except Exception as IndexError:
+                    # print("Is this happening?")
+                    continue
+
+            df_i += (2 + 2/3)
+            df_i = int(df_i)
+    # release the video capture object
+    cap.release()
+    return file_path, video_name_ext, saved_boxes
 
 
 def nonblank_lines(f):
@@ -729,7 +858,8 @@ def get_annotation_paths(img_path, annotation_formats):
     annotation_paths = []
     for ann_dir, ann_ext in annotation_formats.items():
         new_path = os.path.join(OUTPUT_DIR, ann_dir)
-        new_path = os.path.join(new_path, os.path.basename(os.path.normpath(img_path))) #img_path.replace(INPUT_DIR, new_path, 1)
+        path_splits = img_path.split(os.sep)
+        new_path = os.path.join(new_path, f"g{path_splits[5]}_d{path_splits[6]}_{os.path.basename(os.path.normpath(img_path))}") #img_path.replace(INPUT_DIR, new_path, 1)
         pre_path, img_ext = os.path.splitext(new_path)
         new_path = new_path.replace(img_ext, ann_ext, 1)
         annotation_paths.append(new_path)
@@ -799,12 +929,12 @@ def get_json_object_dict(obj, json_object_list):
     if len(json_object_list) > 0:
         class_index, xmin, ymin, xmax, ymax = map(int, obj)
         for d in json_object_list:
-                    if ( d['class_index'] == class_index and
-                         d['bbox']['xmin'] == xmin and
-                         d['bbox']['ymin'] == ymin and
-                         d['bbox']['xmax'] == xmax and
-                         d['bbox']['ymax'] == ymax ) :
-                        return d
+            if ( d['class_index'] == class_index and
+                    d['bbox']['xmin'] == xmin and
+                    d['bbox']['ymin'] == ymin and
+                    d['bbox']['xmax'] == xmax and
+                    d['bbox']['ymax'] == ymax ):
+                return d
     return None
 
 
@@ -860,8 +990,7 @@ def json_file_add_object(frame_data_dict, img_path, anchor_id, pred_counter, obj
 
 
 class LabelTracker():
-    ''' Special thanks to Rafael Caballero Gonzalez '''
-    # extract the OpenCV version info, e.g.:
+
     # OpenCV 3.3.4 -> [major_ver].[minor_ver].[subminor_ver]
     (major_ver, minor_ver, subminor_ver) = (cv2.__version__).split('.')
 
@@ -966,18 +1095,46 @@ def complement_bgr(color):
     k = lo + hi
     return tuple(k - u for u in color)
 
+
+def csv_to_mp4(path_and_file):
+    path, file_ = os.path.split(path_and_file)
+    if path.split(os.sep)[5] == "batist":
+        video_format = "mp4"
+    elif path.split(os.sep)[5] == "holstein":
+        video_format = "mkv"
+    else:
+        video_format = "mkv"
+        mp4_file = file_.replace("log", "cut_video").replace("csv", video_format)
+        return os.path.join(path, mp4_file)
+    
+        
+    mp4_file = file_.replace("log", "insect").replace("csv", video_format)
+    return os.path.join(path, mp4_file)
+
 # change to the directory of this script
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 if __name__ == '__main__':
     # load all images and videos (with multiple extensions) from a directory using OpenCV
     IMAGE_PATH_LIST = []
+    auto_label_list = []
+    saved_boxes_from_vids = {}
     VIDEO_NAME_DICT = {}
-    for f in sorted(os.listdir(INPUT_DIR), key = natural_sort_key):
-        f_path = os.path.join(INPUT_DIR, f)
-        if os.path.isdir(f_path):
-            # skip directories
-            continue
+    from_file = True
+
+    # load class list
+    with open('class_list.txt') as f:
+        CLASS_LIST = list(nonblank_lines(f))
+    last_class_index = len(CLASS_LIST) - 1
+
+    df = pd.read_csv(INPUT_DIR, sep=",", names=["path", "contains_moth", "contains_drone", "autolabel"], engine='python')
+    df_contain_moth = df[(df["contains_moth"] == 1)]
+    iterator_list = df_contain_moth
+
+    for i, row in iterator_list.iterrows():
+        
+        f_path = csv_to_mp4(row["path"])
+
         # check if it is an image
         test_img = cv2.imread(f_path)
         if test_img is not None:
@@ -990,7 +1147,12 @@ if __name__ == '__main__':
             if n_frames > 0:
                 # it is a video
                 desired_img_format = '.jpg'
-                video_frames_path, video_name_ext = convert_video_to_images(f_path, n_frames, desired_img_format)
+
+
+                autolabel = row["autolabel"] == 1
+                video_frames_path, video_name_ext, saved_boxes = convert_video_to_images(f_path, n_frames, desired_img_format, class_list=CLASS_LIST, read_log=autolabel)
+                # if row["autolabel"] == 1:
+                saved_boxes_from_vids = {**saved_boxes_from_vids, **saved_boxes}  # create big dictionary to later add to label files
                 # add video frames to image list
                 frame_list = sorted(os.listdir(video_frames_path), key = natural_sort_key)
                 ## store information about those frames
@@ -1001,47 +1163,66 @@ if __name__ == '__main__':
                 indexes_dict['last_index'] = last_index
                 VIDEO_NAME_DICT[video_name_ext] = indexes_dict
                 IMAGE_PATH_LIST.extend((os.path.join(video_frames_path, frame) for frame in frame_list))
+                auto_label_list.extend([autolabel]*len(frame_list))
     last_img_index = len(IMAGE_PATH_LIST) - 1
 
-    # create output directories
-    if len(VIDEO_NAME_DICT) > 0:
-        if not os.path.exists(TRACKER_DIR):
-            os.makedirs(TRACKER_DIR)
+ 
+
+    # # create output directories
+    # if len(VIDEO_NAME_DICT) > 0:
+    #     if not os.path.exists(TRACKER_DIR):
+    #         os.makedirs(TRACKER_DIR)
     for ann_dir in annotation_formats:
         new_dir = os.path.join(OUTPUT_DIR, ann_dir)
         if not os.path.exists(new_dir):
             os.makedirs(new_dir)
-        for video_name_ext in VIDEO_NAME_DICT:
-            new_video_dir = os.path.join(new_dir, video_name_ext)
-            if not os.path.exists(new_video_dir):
-                os.makedirs(new_video_dir)
+    #     for video_name_ext in VIDEO_NAME_DICT:
+    #         new_video_dir = os.path.join(new_dir, video_name_ext)
+    #         if not os.path.exists(new_video_dir):
+    #             os.makedirs(new_video_dir)
 
     # create empty annotation files for each image, if it doesn't exist already
-    for img_path in IMAGE_PATH_LIST:
+    
+                    
+    sides = ["_l"]
+    if mirror_label:
+        sides.append("_r")
+    print("Loading labels")
+    for i, img_path in enumerate(tqdm(IMAGE_PATH_LIST)):
+        # print(f"Loading {i}/{len(IMAGE_PATH_LIST)}")
         # image info for the .xml file
-        test_img = cv2.imread(img_path)
-        abs_path = os.path.abspath(img_path)
-        folder_name = os.path.dirname(img_path)
-        image_name = os.path.basename(img_path)
-        img_height, img_width, depth = (str(number) for number in test_img.shape)
+        if auto_label_list[i]: #check if relabelling needs to be done
+            test_img = cv2.imread(img_path)
+            abs_path = os.path.abspath(img_path)
+            folder_name = os.path.dirname(img_path)
+            image_name = os.path.basename(img_path)
+            img_height, img_width, depth = (str(number) for number in test_img.shape)
 
-        for ann_path in get_annotation_paths(img_path, annotation_formats):
-            if not os.path.isfile(ann_path):
-                if '.txt' in ann_path:
-                    open(ann_path, 'a').close()
-                elif '.xml' in ann_path:
-                    create_PASCAL_VOC_xml(ann_path, abs_path, folder_name, image_name, img_height, img_width, depth)
+            for ann_path in get_annotation_paths(img_path, annotation_formats):
+                if not os.path.isfile(ann_path):
+                    if '.txt' in ann_path:
+                        open(ann_path, 'a').close()
+                    elif '.xml' in ann_path:
+                        create_PASCAL_VOC_xml(ann_path, abs_path, folder_name, image_name, img_height, img_width, depth)
 
-    # load class list
-    with open('class_list.txt') as f:
-        CLASS_LIST = list(nonblank_lines(f))
-    #print(CLASS_LIST)
-    last_class_index = len(CLASS_LIST) - 1
+            ## add saved image annotations to labels files
+            annotation_paths = get_annotation_paths(img_path, annotation_formats)
+                        
+            
+
+                
+            for side in sides:
+                saved_info = saved_boxes_from_vids.get(img_path+side, False)
+                if saved_info != False:
+                    class_id, p1, p2, w, h = saved_info
+                    save_bounding_box(annotation_paths, class_id, p1, p2, w, h)
+        
+        
 
     # Make the class colors the same each session
     # The colors are in BGR order because we're using OpenCV
     class_rgb = [
-        (0, 0, 255), (255, 0, 0), (0, 255, 0), (255, 255, 0), (0, 255, 255),
+        (255, 0, 0), (0, 0, 255), (0, 255, 0), (255, 255, 0), (0, 255, 255),
         (255, 0, 255), (192, 192, 192), (128, 128, 128), (128, 0, 0),
         (128, 128, 0), (0, 128, 0), (128, 0, 128), (0, 128, 128), (0, 0, 128)]
     class_rgb = np.array(class_rgb)
@@ -1057,11 +1238,14 @@ if __name__ == '__main__':
     cv2.setMouseCallback(WINDOW_NAME, mouse_listener)
 
     # selected image
+    if last_img_index < 0:
+        last_img_index = 1
     cv2.createTrackbar(TRACKBAR_IMG, WINDOW_NAME, 0, last_img_index, set_img_index)
 
     # selected class
     if last_class_index != 0:
         cv2.createTrackbar(TRACKBAR_CLASS, WINDOW_NAME, 0, last_class_index, set_class_index)
+
 
     # initialize
     set_img_index(0)
@@ -1083,11 +1267,11 @@ if __name__ == '__main__':
         # write selected class
         class_name = CLASS_LIST[class_index]
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.6
+        font_scale = 0.5
         margin = 3
         text_width, text_height = cv2.getTextSize(class_name, font, font_scale, LINE_THICKNESS)[0]
-        tmp_img = cv2.rectangle(tmp_img, (mouse_x + LINE_THICKNESS, mouse_y - LINE_THICKNESS), (mouse_x + text_width + margin, mouse_y - text_height - margin), complement_bgr(color), -1)
-        tmp_img = cv2.putText(tmp_img, class_name, (mouse_x + margin, mouse_y - margin), font, font_scale, color, LINE_THICKNESS, cv2.LINE_AA)
+        tmp_img = cv2.rectangle(tmp_img, (mouse_x + LINE_THICKNESS, mouse_y - LINE_THICKNESS - 30), (mouse_x + text_width + margin, mouse_y - text_height - margin - 30), complement_bgr(color), -1)
+        tmp_img = cv2.putText(tmp_img, class_name, (mouse_x + margin, mouse_y - margin - 30), font, font_scale, color, LINE_THICKNESS, cv2.LINE_AA)
         # get annotation paths
         img_path = IMAGE_PATH_LIST[img_index]
         annotation_paths = get_annotation_paths(img_path, annotation_formats)
@@ -1106,6 +1290,10 @@ if __name__ == '__main__':
             if point_2[0] != -1:
                 # save the bounding box
                 save_bounding_box(annotation_paths, class_index, point_1, point_2, width, height)
+                if mirror_label:
+                    pass
+
+
                 # reset the points
                 point_1 = (-1, -1)
                 point_2 = (-1, -1)
